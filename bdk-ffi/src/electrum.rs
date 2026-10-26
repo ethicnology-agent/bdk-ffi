@@ -1,6 +1,7 @@
 use crate::bitcoin::{BlockHash, Header, Transaction, Txid};
 use crate::error::ElectrumError;
 use crate::types::KeychainKind;
+use crate::types::TxAnchor;
 use crate::types::Update;
 use crate::types::{FullScanRequest, SyncRequest};
 
@@ -58,6 +59,34 @@ impl ElectrumClient {
             bdk_electrum::electrum_client::Client::from_config(url.as_str(), config.build())?;
         let client = BdkBdkElectrumClient::new(inner_client);
         Ok(Self(client))
+    }
+
+    /// Insert transactions into the client's transaction cache so that later syncs and full
+    /// scans do not download them again.
+    ///
+    /// Use it to prefill a new client from data the caller already holds, e.g. the wallet's
+    /// transactions (`Wallet::transactions`) and the parent transactions of their inputs, instead
+    /// of keeping one client alive between syncs. Transactions are keyed by their computed txid.
+    pub fn populate_tx_cache(&self, transactions: Vec<Arc<Transaction>>) {
+        self.0.populate_tx_cache(
+            transactions
+                .iter()
+                .map(|tx| BdkTransaction::from(tx.as_ref())),
+        );
+    }
+
+    /// Insert confirmation anchors into the client's anchor cache so that later syncs and full
+    /// scans do not request their Merkle proofs again.
+    ///
+    /// Anchors are keyed by block hash: when the client resolves a different block at that height
+    /// (for example after a reorg), the proof is fetched and validated as usual.
+    pub fn populate_anchor_cache(&self, anchors: Vec<TxAnchor>) {
+        self.0.populate_anchor_cache(anchors.into_iter().map(|a| {
+            (
+                a.txid.0,
+                std::iter::once(bdk_wallet::chain::ConfirmationBlockTime::from(a.anchor)),
+            )
+        }));
     }
 
     /// Full scan the keychain scripts specified with the blockchain (via an Electrum client) and

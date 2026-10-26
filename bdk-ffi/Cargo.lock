@@ -148,6 +148,7 @@ dependencies = [
  "bdk_esplora",
  "bdk_kyoto",
  "bdk_wallet",
+ "serde_json",
  "thiserror",
  "uniffi",
 ]

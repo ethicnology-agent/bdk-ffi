@@ -969,6 +969,35 @@ impl Wallet {
             .map(|changeset| Arc::new(changeset.into()))
     }
 
+    /// Insert a trusted block checkpoint into this wallet's local chain.
+    ///
+    /// For a newly created recovering wallet, insert its known birthday block before building
+    /// a multi-wallet CBF node. The birthday block itself is excluded from scanning; choose a
+    /// block before its first possible transaction. This only applies chain data, does not
+    /// validate the supplied hash, and must be persisted like any other wallet change.
+    pub fn insert_checkpoint(&self, block_id: BlockId) -> Result<(), CannotConnectError> {
+        let mut wallet = self.get_wallet();
+        if block_id.height == 0 && wallet.local_chain().genesis_hash() != block_id.hash.0 {
+            return Err(CannotConnectError::Include { height: 0 });
+        }
+        let chain = wallet.latest_checkpoint().insert(block_id.into());
+        wallet
+            .apply_update(bdk_wallet::Update {
+                chain: Some(chain),
+                ..Default::default()
+            })
+            .map_err(Into::into)
+    }
+
+    /// The public descriptor's stable id. CBF multi-wallet updates use the external keychain id.
+    pub fn descriptor_id(&self, keychain: KeychainKind) -> String {
+        use bdk_wallet::chain::DescriptorExt;
+        self.get_wallet()
+            .public_descriptor(keychain)
+            .descriptor_id()
+            .to_string()
+    }
+
     /// Returns the latest checkpoint.
     pub fn latest_checkpoint(&self) -> BlockId {
         self.get_wallet().latest_checkpoint().block_id().into()

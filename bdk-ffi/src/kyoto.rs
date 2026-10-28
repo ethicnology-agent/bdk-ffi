@@ -18,15 +18,16 @@ use bdk_kyoto::UpdateSubscriber;
 use bdk_kyoto::Warning as Warn;
 use lifecycle::NodeLifecycle;
 
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use crate::bitcoin::BlockHash;
 use crate::bitcoin::Transaction;
 use crate::bitcoin::Wtxid;
+use crate::bitcoin::{BlockHash, Header};
 use crate::error::CbfError;
 use crate::types::BlockId;
 use crate::types::Update;
@@ -53,9 +54,26 @@ pub struct CbfComponents {
 pub struct CbfClient {
     sender: Arc<Requester>,
     lifecycle: Arc<NodeLifecycle>,
-    info_rx: Mutex<(Receiver<bdk_kyoto::Info>, ScanProgress)>,
+    info_rx: Mutex<InfoReceiver>,
+    sync_info_tx: tokio::sync::mpsc::UnboundedSender<Info>,
     warning_rx: Mutex<Receiver<bdk_kyoto::Warning>>,
-    update_rx: Mutex<UpdateSubscriber<bdk_kyoto::wallets::Single>>,
+    update_rx: Mutex<WalletUpdates>,
+}
+
+#[derive(Debug)]
+struct InfoReceiver {
+    native: Receiver<bdk_kyoto::Info>,
+    synced: tokio::sync::mpsc::UnboundedReceiver<Info>,
+    progress: ScanProgress,
+}
+
+#[derive(Debug)]
+enum WalletUpdates {
+    Single {
+        descriptor_id: String,
+        subscriber: UpdateSubscriber<bdk_kyoto::wallets::Single>,
+    },
+    Multiple(UpdateSubscriber<bdk_kyoto::wallets::Multiple>),
 }
 
 /// A [`CbfNode`] gathers transactions for a [`Wallet`].
@@ -208,32 +226,11 @@ impl CbfBuilder {
                 }
             }),
         };
-        // Match the upstream routine-sync rewind over checkpoint entries.
-        let start_height = recovery_checkpoint.map(|cp| cp.height).unwrap_or_else(|| {
-            wallet
-                .latest_checkpoint()
-                .iter()
-                .take(8)
-                .last()
-                .unwrap()
-                .height()
-        });
-
-        let mut builder = BDKCbfBuilder::new(wallet.network())
-            .required_peers(self.connections)
-            .handshake_timeout(self.handshake_timeout)
-            .response_timeout(self.response_timeout)
-            .add_peers(trusted_peers);
-
-        if let Some(proxy) = &self.socks5_proxy {
-            let port = proxy.port;
-            let addr = proxy.address.inner;
-            builder = builder.socks5_proxy(SocketAddr::new(addr, port));
-        }
-
-        if self.whitelist_only {
-            builder = builder.whitelist_only();
-        }
+        let start_height = recovery_checkpoint
+            .map(|cp| cp.height)
+            .unwrap_or_else(|| sync_start_height(&wallet));
+        let descriptor_id = wallet_descriptor_id(&wallet);
+        let builder = self.node_builder(wallet.network(), trusted_peers);
 
         let client = match self.scan_type {
             ScanType::Sync => builder.build_with_wallet(
@@ -252,27 +249,155 @@ impl CbfBuilder {
             ),
         }
         .expect("networks match by definition");
-        let (client, logging, update_subscriber) = client.subscribe();
+        let (client, logging, subscriber) = client.subscribe();
         let (client, node) = client.managed_start();
-        let requester = client.requester();
+        components(
+            client.requester(),
+            node,
+            logging,
+            WalletUpdates::Single {
+                descriptor_id,
+                subscriber,
+            },
+            start_height,
+        )
+    }
 
-        let lifecycle = Arc::new(NodeLifecycle::new(Some(node)));
-        let node = CbfNode {
+    /// Build one long-running node for a fixed set of wallets on the same network.
+    ///
+    /// Only `ScanType::Sync` is supported. For recovery, insert a trusted birthday
+    /// checkpoint into the wallet before building and create/load it with a lookahead
+    /// covering the recovery script window (for example 1,000 per keychain).
+    /// The node starts at the minimum wallet checkpoint, with up to seven blocks of
+    /// rewind where known checkpoints exist. Rebuild the node when its wallet set changes.
+    /// Wallets must have distinct external descriptor ids.
+    pub fn build_with_wallets(&self, wallets: Vec<Arc<Wallet>>) -> Result<CbfComponents, CbfError> {
+        if !matches!(self.scan_type, ScanType::Sync) {
+            return Err(CbfError::InvalidConfiguration {
+                reason: "multi-wallet nodes require ScanType::Sync; seed birthday checkpoints on the wallets".into(),
+            });
+        }
+        let network = wallets
+            .first()
+            .ok_or_else(|| CbfError::InvalidConfiguration {
+                reason: "at least one wallet is required".into(),
+            })?
+            .network();
+        // Validate before taking locks so duplicate references cannot deadlock.
+        let mut ids = HashSet::new();
+        for wallet in &wallets {
+            if wallet.network() != network {
+                return Err(CbfError::InvalidConfiguration {
+                    reason: "wallet networks must match".into(),
+                });
+            }
+            if !ids.insert(wallet.descriptor_id(bdk_wallet::KeychainKind::External)) {
+                return Err(CbfError::InvalidConfiguration {
+                    reason: "external descriptor ids must be unique".into(),
+                });
+            }
+        }
+        // A stable lock order also permits concurrent builders sharing wallet objects.
+        let mut wallets = wallets;
+        wallets.sort_by_key(|wallet| Arc::as_ptr(wallet) as usize);
+        let guards: Vec<_> = wallets.iter().map(|wallet| wallet.get_wallet()).collect();
+        let start_height = guards
+            .iter()
+            .map(|wallet| sync_start_height(wallet))
+            .min()
+            .unwrap();
+        let client = self
+            .node_builder(
+                network,
+                self.peers.iter().cloned().map(Into::into).collect(),
+            )
+            .build_with_wallets(
+                guards
+                    .iter()
+                    .map(|wallet| {
+                        (
+                            &***wallet,
+                            bdk_kyoto::SyncConfig::sync_from_last_checkpoint().build(),
+                        )
+                    })
+                    .collect(),
+            )
+            .map_err(|error| CbfError::InvalidConfiguration {
+                reason: error.to_string(),
+            })?;
+        let (client, logging, subscriber) = client.subscribe();
+        let (client, node) = client.managed_start();
+        Ok(components(
+            client.requester(),
+            node,
+            logging,
+            WalletUpdates::Multiple(subscriber),
+            start_height,
+        ))
+    }
+}
+
+impl CbfBuilder {
+    fn node_builder(&self, network: Network, trusted_peers: Vec<TrustedPeer>) -> BDKCbfBuilder {
+        let mut builder = BDKCbfBuilder::new(network)
+            .required_peers(self.connections)
+            .handshake_timeout(self.handshake_timeout)
+            .response_timeout(self.response_timeout)
+            .add_peers(trusted_peers);
+        if let Some(proxy) = &self.socks5_proxy {
+            builder = builder.socks5_proxy(SocketAddr::new(proxy.address.inner, proxy.port));
+        }
+        if self.whitelist_only {
+            builder = builder.whitelist_only();
+        }
+        builder
+    }
+}
+
+// Keep the progress denominator aligned with Kyoto's bounded-height reorg rewind.
+fn sync_start_height(wallet: &bdk_wallet::Wallet) -> u32 {
+    let tip = wallet.latest_checkpoint();
+    let floor = tip.height().saturating_sub(7);
+    tip.iter()
+        .take_while(|cp| cp.height() >= floor)
+        .last()
+        .unwrap()
+        .height()
+}
+
+fn wallet_descriptor_id(wallet: &bdk_wallet::Wallet) -> String {
+    use bdk_wallet::chain::DescriptorExt;
+    wallet
+        .public_descriptor(bdk_wallet::KeychainKind::External)
+        .descriptor_id()
+        .to_string()
+}
+
+fn components(
+    requester: Requester,
+    node: Node,
+    logging: bdk_kyoto::LoggingSubscribers,
+    updates: WalletUpdates,
+    start_height: u32,
+) -> CbfComponents {
+    let lifecycle = Arc::new(NodeLifecycle::new(Some(node)));
+    let (sync_info_tx, synced) = tokio::sync::mpsc::unbounded_channel();
+    CbfComponents {
+        node: Arc::new(CbfNode {
             lifecycle: lifecycle.clone(),
-        };
-
-        let client = CbfClient {
+        }),
+        client: Arc::new(CbfClient {
             sender: Arc::new(requester),
             lifecycle,
-            info_rx: Mutex::new((logging.info_subscriber, ScanProgress::new(start_height))),
+            info_rx: Mutex::new(InfoReceiver {
+                native: logging.info_subscriber,
+                synced,
+                progress: ScanProgress::new(start_height),
+            }),
+            sync_info_tx,
             warning_rx: Mutex::new(logging.warning_subscriber),
-            update_rx: Mutex::new(update_subscriber),
-        };
-
-        CbfComponents {
-            client: Arc::new(client),
-            node: Arc::new(node),
-        }
+            update_rx: Mutex::new(updates),
+        }),
     }
 }
 
@@ -281,8 +406,16 @@ impl CbfClient {
     /// Return the next available info message from a node. If none is returned, the node has stopped.
     pub async fn next_info(&self) -> Result<Info, CbfError> {
         let mut info = self.info_rx.lock().await;
-        let value = info.0.recv().await.ok_or(CbfError::NodeStopped)?;
-        Ok(info.1.map(value))
+        let InfoReceiver {
+            native,
+            synced,
+            progress,
+        } = &mut *info;
+        tokio::select! {
+            biased;
+            value = synced.recv() => value.ok_or(CbfError::NodeStopped),
+            value = native.recv() => value.map(|value| progress.map(value)).ok_or(CbfError::NodeStopped),
+        }
     }
 
     /// Return the next available warning message from a node. If none is returned, the node has stopped.
@@ -295,17 +428,107 @@ impl CbfClient {
             .ok_or(CbfError::NodeStopped)
     }
 
-    /// Return an [`Update`]. This is method returns once the node syncs to the rest of
-    /// the network or a new block has been gossiped.
+    /// Wait until filters and matched blocks reach a tip, then return a wallet update.
+    /// Call repeatedly while the node is running; the next call waits for a new sync boundary.
+    /// Cancellation preserves pending work. Only valid for the single-wallet builder.
+    /// Apply and persist each returned update before requesting another.
     pub async fn update(&self) -> Result<Update, CbfError> {
-        let update = self
-            .update_rx
-            .lock()
-            .await
+        let mut receiver = self.update_rx.lock().await;
+        let WalletUpdates::Single { subscriber, .. } = &mut *receiver else {
+            return Err(CbfError::InvalidConfiguration {
+                reason: "use updates() with a multi-wallet node".into(),
+            });
+        };
+        let update = subscriber
             .update()
             .await
             .map_err(|_| CbfError::NodeStopped)?;
+        self.notify_synced(&update);
         Ok(Update(update))
+    }
+
+    /// Wait for the next caught-up boundary and route updates by public external descriptor id.
+    /// Works with both builders. Call in a continual loop, applying/persisting every update
+    /// to the wallet whose `descriptor_id(External)` matches its key. Cancellation is safe.
+    pub async fn updates(&self) -> Result<HashMap<String, Arc<Update>>, CbfError> {
+        let mut receiver = self.update_rx.lock().await;
+        let updates: HashMap<String, Arc<Update>> = match &mut *receiver {
+            WalletUpdates::Single {
+                descriptor_id,
+                subscriber,
+            } => {
+                let update = subscriber
+                    .update()
+                    .await
+                    .map_err(|_| CbfError::NodeStopped)?;
+                HashMap::from([(descriptor_id.clone(), Arc::new(Update(update)))])
+            }
+            WalletUpdates::Multiple(subscriber) => subscriber
+                .updates()
+                .await
+                .map_err(|_| CbfError::NodeStopped)?
+                .map(|(id, update)| (id.to_string(), Arc::new(Update(update))))
+                .collect(),
+        };
+        if let Some(update) = updates.values().next() {
+            self.notify_synced(&update.0);
+        }
+        Ok(updates)
+    }
+
+    /// Recheck filters strictly after `height`, bounded by the node's configured start.
+    /// This does not add wallets or scripts to the node's fixed wallet snapshot.
+    /// Call after the first update/Synced boundary: bip157 ignores rescans during header sync.
+    pub fn rescan_from(&self, height: u32) -> Result<(), CbfError> {
+        self.sender.rescan_from(height).map_err(From::from)
+    }
+
+    /// Recheck filters after the configured start checkpoint.
+    /// Call after the first update/Synced boundary; ignored during header sync.
+    pub fn rescan(&self) -> Result<(), CbfError> {
+        self.sender.rescan().map_err(From::from)
+    }
+
+    /// The height and hash of the node's current chain of most work.
+    /// Header sync may be ahead of wallet/filter sync; use returned updates or `Info::Synced`
+    /// to identify a caught-up wallet boundary.
+    pub async fn chain_tip(&self) -> Result<BlockId, CbfError> {
+        let cp = self
+            .sender
+            .chain_tip()
+            .await
+            .map_err(|_| CbfError::NodeStopped)?;
+        Ok(BlockId {
+            height: cp.height,
+            hash: Arc::new(BlockHash(cp.hash)),
+        })
+    }
+
+    /// Look up a header in the node's locally synced header chain.
+    pub async fn get_header(&self, height: u32) -> Result<Option<Header>, CbfError> {
+        self.sender
+            .get_header(height)
+            .await
+            .map_err(|_| CbfError::NodeStopped)
+            .map(|header| header.map(|indexed| indexed.header.into()))
+    }
+
+    /// Submit one transaction, or a parent followed by its spending child, to a random peer.
+    /// Returns when data was sent to at least one peer, not an acceptance or confirmation.
+    pub async fn submit_package(
+        &self,
+        transactions: Vec<Arc<Transaction>>,
+    ) -> Result<Arc<Wtxid>, CbfError> {
+        let package =
+            bip157::Package::from_vec(transactions.iter().map(|tx| tx.as_ref().into()).collect())
+                .map_err(|error| CbfError::InvalidPackage {
+                reason: error.to_string(),
+            })?;
+        self.sender
+            .submit_package(package)
+            .await
+            .map_err(From::from)
+            .map(|wtxid| Arc::new(Wtxid(wtxid)))
     }
 
     /// Broadcast a transaction to the network, erroring if the node has stopped running.
@@ -386,6 +609,15 @@ impl CbfClient {
             .collect())
     }
 
+    /// Count all live connections, including Tor and other address types omitted by `peer_info`.
+    pub async fn peer_count(&self) -> Result<u64, CbfError> {
+        self.sender
+            .peer_info()
+            .await
+            .map_err(|_| CbfError::NodeStopped)
+            .map(|peers| peers.len() as u64)
+    }
+
     /// Check whether the node accepts requests and has not been asked to stop.
     /// Use [`CbfNode::await_termination`] to acknowledge that its native thread has exited.
     pub fn is_running(&self) -> bool {
@@ -399,6 +631,17 @@ impl CbfClient {
         let result = self.sender.shutdown().map_err(From::from);
         self.lifecycle.request_stop();
         result
+    }
+}
+
+impl CbfClient {
+    fn notify_synced(&self, update: &bdk_wallet::Update) {
+        if let Some(cp) = &update.chain {
+            // An unbounded send cannot suspend after the subscriber has consumed the boundary.
+            let _ = self.sync_info_tx.send(Info::Synced {
+                tip: cp.block_id().into(),
+            });
+        }
     }
 }
 
@@ -435,6 +678,11 @@ pub enum Info {
         filters_height: u32,
         fraction: f32,
     },
+    /// Filters and queued matching blocks have reached this wallet update boundary.
+    /// Emitted only when `update`/`updates` returns. The application must still apply and persist
+    /// that update. A `NewChainHeight` above this tip signals another scanning interval;
+    /// lower heights may still be queued in the independent native information stream.
+    Synced { tip: BlockId },
     /// A relevant block was downloaded from a peer.
     BlockReceived(String),
 }
@@ -663,7 +911,7 @@ impl DisplayExt for RejectReason {
 
 #[cfg(test)]
 mod tests {
-    use super::{CbfNode, NodeLifecycle};
+    use super::{tokio, CbfNode, NodeLifecycle};
     use std::sync::Arc;
 
     #[test]
@@ -690,5 +938,194 @@ mod tests {
         });
 
         node.run();
+    }
+
+    fn public_wallet(branch: u32, lookahead: u32) -> Arc<crate::wallet::Wallet> {
+        use crate::{
+            bitcoin::NetworkKind, descriptor::Descriptor, store::Persister, wallet::Wallet,
+        };
+        let descriptors: serde_json::Value =
+            serde_json::from_str(include_str!("kyoto/public-descriptors.json")).unwrap();
+        let external = descriptors["external"]
+            .as_str()
+            .unwrap()
+            .replace("/0/*", &format!("/{branch}/*"));
+        let internal = descriptors["internal"]
+            .as_str()
+            .unwrap()
+            .replace("/1/*", &format!("/{}/*", branch + 1));
+        Arc::new(
+            Wallet::new(
+                Arc::new(Descriptor::new(external, NetworkKind::Main).unwrap()),
+                Arc::new(Descriptor::new(internal, NetworkKind::Main).unwrap()),
+                super::Network::Bitcoin,
+                Arc::new(Persister::new_in_memory().unwrap()),
+                lookahead,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn checkpoint(height: u32) -> crate::types::BlockId {
+        use bdk_wallet::bitcoin::hashes::Hash;
+        crate::types::BlockId {
+            height,
+            hash: Arc::new(crate::bitcoin::BlockHash(
+                super::bip157::BlockHash::from_byte_array([height as u8; 32]),
+            )),
+        }
+    }
+
+    #[test]
+    fn birthday_checkpoint_and_descriptor_id_are_available_to_multi_wallet_callers() {
+        use bdk_wallet::chain::DescriptorExt;
+        let wallet = public_wallet(0, 1000);
+        let birthday = checkpoint(900_000);
+        wallet.insert_checkpoint(birthday.clone()).unwrap();
+        assert_eq!(wallet.latest_checkpoint(), birthday);
+        assert_eq!(wallet.checkpoints().len(), 2);
+        assert_eq!(
+            super::sync_start_height(&wallet.get_wallet()),
+            birthday.height
+        );
+        assert_eq!(wallet.get_wallet().spk_index().lookahead(), 1000);
+        assert_eq!(
+            wallet.descriptor_id(bdk_wallet::KeychainKind::External),
+            wallet
+                .get_wallet()
+                .public_descriptor(bdk_wallet::KeychainKind::External)
+                .descriptor_id()
+                .to_string()
+        );
+        assert_ne!(
+            wallet.descriptor_id(bdk_wallet::KeychainKind::External),
+            wallet.descriptor_id(bdk_wallet::KeychainKind::Internal)
+        );
+        assert!(wallet.insert_checkpoint(checkpoint(0)).is_err());
+        assert_eq!(wallet.latest_checkpoint(), birthday);
+        let staged: bdk_wallet::ChangeSet = wallet.take_staged().unwrap().as_ref().clone().into();
+        assert!(staged.local_chain.blocks.contains_key(&birthday.height));
+    }
+
+    #[test]
+    fn multi_wallet_configuration_rejects_empty_duplicates_and_recovery() {
+        let builder = super::CbfBuilder::new().only_configured_peers();
+        assert!(matches!(
+            builder.build_with_wallets(vec![]),
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        let wallet = public_wallet(0, 1000);
+        assert!(matches!(
+            builder.build_with_wallets(vec![wallet.clone(), wallet.clone()]),
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        let duplicate = public_wallet(0, 1000);
+        assert!(matches!(
+            builder.build_with_wallets(vec![wallet.clone(), duplicate]),
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            builder
+                .scan_type(super::ScanType::Recovery {
+                    used_script_index: 1000,
+                    checkpoint: super::RecoveryPoint::SegwitActivation
+                })
+                .build_with_wallets(vec![wallet]),
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn multi_wallet_requests_cancel_safely_and_terminate_without_network() {
+        let first = public_wallet(0, 1000);
+        let second = public_wallet(2, 1000);
+        first.insert_checkpoint(checkpoint(900_000)).unwrap();
+        second.insert_checkpoint(checkpoint(903_000)).unwrap();
+        let components = super::CbfBuilder::new()
+            .only_configured_peers()
+            .build_with_wallets(vec![first, second])
+            .unwrap();
+        assert!(components.client.is_running());
+        // These enqueue the real bip157 commands without starting DNS or a peer.
+        components.client.rescan_from(901_234).unwrap();
+        components.client.rescan().unwrap();
+        assert!(matches!(
+            components.client.update().await,
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        // Neither a cancelled wallet receiver nor a cancelled info receiver holds its mutex.
+        for _ in 0..2 {
+            assert!(super::tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                components.client.updates()
+            )
+            .await
+            .is_err());
+            assert!(super::tokio::time::timeout(
+                std::time::Duration::from_millis(5),
+                components.client.next_info()
+            )
+            .await
+            .is_err());
+        }
+        components.client.shutdown().unwrap();
+        assert!(components.node.await_termination(1000).await);
+        assert!(!components.client.is_running());
+        assert!(matches!(
+            components.client.rescan_from(901_234),
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+        assert!(matches!(
+            components.client.chain_tip().await,
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+        assert!(matches!(
+            components.client.get_header(901_234).await,
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+        assert!(matches!(
+            components.client.peer_count().await,
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+        assert!(matches!(
+            components.client.updates().await,
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+    }
+
+    #[tokio::test]
+    async fn synced_event_is_emitted_after_a_wallet_update_boundary() {
+        let wallet = public_wallet(0, 1000);
+        let components = super::CbfBuilder::new()
+            .only_configured_peers()
+            .build(&wallet);
+        // Native downloads alone never map to Synced; completion is an update boundary.
+        let cp = wallet
+            .get_wallet()
+            .latest_checkpoint()
+            .insert(checkpoint(900_000).into());
+        components.client.notify_synced(&bdk_wallet::Update {
+            chain: Some(cp),
+            ..Default::default()
+        });
+        assert!(
+            matches!(components.client.next_info().await.unwrap(), super::Info::Synced { tip } if tip == checkpoint(900_000))
+        );
+        components.client.shutdown().unwrap();
+        assert!(components.node.await_termination(1000).await);
+    }
+
+    #[tokio::test]
+    async fn packages_are_validated_before_contacting_the_node() {
+        let wallet = public_wallet(0, 1000);
+        let components = super::CbfBuilder::new()
+            .only_configured_peers()
+            .build(&wallet);
+        assert!(matches!(
+            components.client.submit_package(vec![]).await,
+            Err(crate::error::CbfError::InvalidPackage { .. })
+        ));
+        components.client.shutdown().unwrap();
+        assert!(components.node.await_termination(1000).await);
     }
 }

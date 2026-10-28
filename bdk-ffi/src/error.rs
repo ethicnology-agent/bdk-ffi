@@ -178,6 +178,10 @@ pub enum CannotConnectError {
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 #[uniffi::export(Debug, Display)]
 pub enum CbfError {
+    #[error("invalid compact-filter configuration: {reason}")]
+    InvalidConfiguration { reason: String },
+    #[error("invalid transaction package: {reason}")]
+    InvalidPackage { reason: String },
     #[error("the node is no longer running")]
     NodeStopped,
 }

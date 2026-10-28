@@ -40,6 +40,8 @@ just test
 just publish-local
 ```
 
+See [Compact block filter nodes](docs/CBF.md) for the long-running, multi-wallet Kyoto API and recovery checkpoints.
+
 ## Contributing
 
 To add new structs and functions, see the [UniFFI User Guide](https://mozilla.github.io/uniffi-rs/) and the [uniffi-examples](https://thunderbiscuit.github.io/uniffi-examples/) repository.

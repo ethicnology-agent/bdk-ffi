@@ -12,12 +12,10 @@ use bdk_kyoto::Receiver;
 use bdk_kyoto::RejectReason;
 use bdk_kyoto::Requester;
 use bdk_kyoto::TrustedPeer;
-use bdk_kyoto::UnboundedReceiver;
 use bdk_kyoto::UpdateSubscriber;
 use bdk_kyoto::Warning as Warn;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +31,6 @@ use crate::wallet::Wallet;
 use crate::FeeRate;
 
 const DEFAULT_CONNECTIONS: u8 = 2;
-const CWD_PATH: &str = ".";
 const TCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const MESSAGE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -50,8 +47,8 @@ pub struct CbfComponents {
 #[derive(Debug, uniffi::Object)]
 pub struct CbfClient {
     sender: Arc<Requester>,
-    info_rx: Mutex<Receiver<bdk_kyoto::Info>>,
-    warning_rx: Mutex<UnboundedReceiver<bdk_kyoto::Warning>>,
+    info_rx: Mutex<(Receiver<bdk_kyoto::Info>, ScanProgress)>,
+    warning_rx: Mutex<Receiver<bdk_kyoto::Warning>>,
     update_rx: Mutex<UpdateSubscriber<bdk_kyoto::wallets::Single>>,
 }
 
@@ -91,7 +88,6 @@ impl CbfNode {
 /// * List of `Peer`: Bitcoin full-nodes for the light client to connect to. May be empty.
 /// * `connections`: The number of connections for the light client to maintain.
 /// * `scan_type`: Sync, recover, or start a new wallet. For more information see [`ScanType`].
-/// * `data_dir`: Optional directory to store block headers and peers.
 ///
 /// A note on recovering wallets. Developers should allow users to provide an
 /// approximate recovery height and an estimated number of transactions for the
@@ -103,7 +99,6 @@ pub struct CbfBuilder {
     connections: u8,
     handshake_timeout: Duration,
     response_timeout: Duration,
-    data_dir: Option<String>,
     scan_type: ScanType,
     socks5_proxy: Option<Socks5Proxy>,
     peers: Vec<Peer>,
@@ -120,7 +115,6 @@ impl CbfBuilder {
             connections: DEFAULT_CONNECTIONS,
             handshake_timeout: TCP_HANDSHAKE_TIMEOUT,
             response_timeout: MESSAGE_RESPONSE_TIMEOUT,
-            data_dir: None,
             scan_type: ScanType::default(),
             socks5_proxy: None,
             peers: Vec::new(),
@@ -132,15 +126,6 @@ impl CbfBuilder {
     pub fn connections(&self, connections: u8) -> Arc<Self> {
         Arc::new(CbfBuilder {
             connections,
-            ..self.clone()
-        })
-    }
-
-    /// Directory to store block headers and peers. If none is provided, the current
-    /// working directory will be used.
-    pub fn data_dir(&self, data_dir: String) -> Arc<Self> {
-        Arc::new(CbfBuilder {
-            data_dir: Some(data_dir),
             ..self.clone()
         })
     }
@@ -200,53 +185,37 @@ impl CbfBuilder {
             trusted_peers.push(peer.clone().into());
         }
 
-        let scan_type = match self.scan_type.clone() {
-            ScanType::Sync => bdk_kyoto::ScanType::Sync,
-            ScanType::Recovery {
-                used_script_index,
-                checkpoint,
-            } => {
-                let network = wallet.network();
-                match checkpoint {
-                    RecoveryPoint::GenesisBlock => bdk_kyoto::ScanType::Recovery {
-                        used_script_index,
-                        checkpoint: HashCheckpoint::from_genesis(network),
-                    },
-                    RecoveryPoint::SegwitActivation if matches!(network, Network::Bitcoin) => {
-                        bdk_kyoto::ScanType::Recovery {
-                            used_script_index,
-                            checkpoint: HashCheckpoint::segwit_activation(),
-                        }
-                    }
-                    RecoveryPoint::TaprootActivation if matches!(network, Network::Bitcoin) => {
-                        bdk_kyoto::ScanType::Recovery {
-                            used_script_index,
-                            checkpoint: HashCheckpoint::taproot_activation(),
-                        }
-                    }
-                    RecoveryPoint::SegwitActivation | RecoveryPoint::TaprootActivation => {
-                        bdk_kyoto::ScanType::Recovery {
-                            used_script_index,
-                            checkpoint: HashCheckpoint::from_genesis(network),
-                        }
-                    }
-                    RecoveryPoint::Other { birthday } => bdk_kyoto::ScanType::Recovery {
-                        used_script_index,
-                        checkpoint: HashCheckpoint::new(birthday.height, birthday.hash.0),
-                    },
+        let recovery_checkpoint = match self.scan_type.clone() {
+            ScanType::Sync => None,
+            ScanType::Recovery { checkpoint, .. } => Some(match checkpoint {
+                RecoveryPoint::GenesisBlock => HashCheckpoint::from_genesis(wallet.network()),
+                RecoveryPoint::SegwitActivation if wallet.network() == Network::Bitcoin => {
+                    HashCheckpoint::segwit_activation()
                 }
-            }
+                RecoveryPoint::TaprootActivation if wallet.network() == Network::Bitcoin => {
+                    HashCheckpoint::taproot_activation()
+                }
+                RecoveryPoint::SegwitActivation | RecoveryPoint::TaprootActivation => {
+                    HashCheckpoint::from_genesis(wallet.network())
+                }
+                RecoveryPoint::Other { birthday } => {
+                    HashCheckpoint::new(birthday.height, birthday.hash.0)
+                }
+            }),
         };
-
-        let path_buf = self
-            .data_dir
-            .clone()
-            .map(|path| PathBuf::from(&path))
-            .unwrap_or(PathBuf::from(CWD_PATH));
+        // Match the upstream routine-sync rewind over checkpoint entries.
+        let start_height = recovery_checkpoint.map(|cp| cp.height).unwrap_or_else(|| {
+            wallet
+                .latest_checkpoint()
+                .iter()
+                .take(8)
+                .last()
+                .unwrap()
+                .height()
+        });
 
         let mut builder = BDKCbfBuilder::new(wallet.network())
             .required_peers(self.connections)
-            .data_dir(path_buf)
             .handshake_timeout(self.handshake_timeout)
             .response_timeout(self.response_timeout)
             .add_peers(trusted_peers);
@@ -261,10 +230,24 @@ impl CbfBuilder {
             builder = builder.whitelist_only();
         }
 
-        let (client, logging, update_subscriber) = builder
-            .build_with_wallet(&wallet, scan_type)
-            .expect("networks match by definition")
-            .subscribe();
+        let client = match self.scan_type {
+            ScanType::Sync => builder.build_with_wallet(
+                &wallet,
+                bdk_kyoto::SyncConfig::sync_from_last_checkpoint().build(),
+            ),
+            ScanType::Recovery {
+                used_script_index, ..
+            } => builder.build_with_wallet(
+                &wallet,
+                bdk_kyoto::SyncConfig::wallet_recovery_sync(
+                    recovery_checkpoint.expect("recovery checkpoint was resolved"),
+                    used_script_index,
+                )
+                .build(),
+            ),
+        }
+        .expect("networks match by definition");
+        let (client, logging, update_subscriber) = client.subscribe();
         let (client, node) = client.managed_start();
         let requester = client.requester();
 
@@ -274,7 +257,7 @@ impl CbfBuilder {
 
         let client = CbfClient {
             sender: Arc::new(requester),
-            info_rx: Mutex::new(logging.info_subscriber),
+            info_rx: Mutex::new((logging.info_subscriber, ScanProgress::new(start_height))),
             warning_rx: Mutex::new(logging.warning_subscriber),
             update_rx: Mutex::new(update_subscriber),
         };
@@ -290,12 +273,9 @@ impl CbfBuilder {
 impl CbfClient {
     /// Return the next available info message from a node. If none is returned, the node has stopped.
     pub async fn next_info(&self) -> Result<Info, CbfError> {
-        let mut info_rx = self.info_rx.lock().await;
-        info_rx
-            .recv()
-            .await
-            .map(|e| e.into())
-            .ok_or(CbfError::NodeStopped)
+        let mut info = self.info_rx.lock().await;
+        let value = info.0.recv().await.ok_or(CbfError::NodeStopped)?;
+        Ok(info.1.map(value))
     }
 
     /// Return the next available warning message from a node. If none is returned, the node has stopped.
@@ -410,32 +390,70 @@ impl CbfClient {
     }
 }
 
-/// A log message from the node.
+/// A log message from the node. Progress describes downloads, not persisted wallet state.
 #[derive(Debug, uniffi::Enum)]
 pub enum Info {
     /// All the required connections have been met. This is subject to change.
     ConnectionsMet,
     /// The node was able to successfully connect to a remote peer.
     SuccessfulHandshake,
-    /// A percentage value of filters that have been scanned.
-    Progress {
-        /// The height of the local block chain.
+    /// The highest downloaded block header, used as the progress denominator.
+    NewChainHeight { chain_height: u32 },
+    /// Compact filter header download progress over this scan's height range.
+    CfHeadersProgress {
         chain_height: u32,
-        /// The percent of filters downloaded.
-        filters_downloaded_percent: f32,
+        headers_height: u32,
+        fraction: f32,
+    },
+    /// Compact filter download progress over this scan's height range.
+    FiltersProgress {
+        chain_height: u32,
+        filters_height: u32,
+        fraction: f32,
     },
     /// A relevant block was downloaded from a peer.
     BlockReceived(String),
 }
 
-impl From<bdk_kyoto::Info> for Info {
-    fn from(value: bdk_kyoto::Info) -> Info {
+#[derive(Debug)]
+struct ScanProgress {
+    start_height: u32,
+    chain_height: u32,
+}
+
+impl ScanProgress {
+    fn new(start_height: u32) -> Self {
+        Self {
+            start_height,
+            chain_height: start_height,
+        }
+    }
+
+    fn fraction(&self, height: u32) -> f32 {
+        let total = self.chain_height.saturating_sub(self.start_height);
+        if total == 0 {
+            return 0.0;
+        }
+        (height.saturating_sub(self.start_height) as f32 / total as f32).clamp(0.0, 1.0)
+    }
+
+    fn map(&mut self, value: bdk_kyoto::Info) -> Info {
         match value {
             bdk_kyoto::Info::ConnectionsMet => Info::ConnectionsMet,
             bdk_kyoto::Info::SuccessfulHandshake => Info::SuccessfulHandshake,
-            bdk_kyoto::Info::Progress(progress) => Info::Progress {
-                filters_downloaded_percent: progress.percentage_complete(),
-                chain_height: progress.chain_height(),
+            bdk_kyoto::Info::NewChainHeight(chain_height) => {
+                self.chain_height = chain_height;
+                Info::NewChainHeight { chain_height }
+            }
+            bdk_kyoto::Info::CFHeadersAdded(headers_height) => Info::CfHeadersProgress {
+                chain_height: self.chain_height,
+                headers_height,
+                fraction: self.fraction(headers_height),
+            },
+            bdk_kyoto::Info::FilterAdded(filters_height) => Info::FiltersProgress {
+                chain_height: self.chain_height,
+                filters_height,
+                fraction: self.fraction(filters_height),
             },
             bdk_kyoto::Info::BlockReceived(block) => Info::BlockReceived(block.to_string()),
         }
@@ -623,6 +641,23 @@ impl DisplayExt for RejectReason {
 mod tests {
     use super::CbfNode;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn progress_uses_the_scan_checkpoint_and_current_header_tip() {
+        let mut progress = super::ScanProgress::new(100);
+        let _ = progress.map(bdk_kyoto::Info::NewChainHeight(200));
+        assert!(matches!(
+            progress.map(bdk_kyoto::Info::CFHeadersAdded(150)),
+            super::Info::CfHeadersProgress { chain_height: 200, headers_height: 150, fraction } if fraction == 0.5
+        ));
+        assert!(matches!(
+            progress.map(bdk_kyoto::Info::FilterAdded(200)),
+            super::Info::FiltersProgress { chain_height: 200, filters_height: 200, fraction } if fraction == 1.0
+        ));
+        assert_eq!(progress.fraction(99), 0.0);
+        assert_eq!(progress.fraction(201), 1.0);
+        assert_eq!(super::ScanProgress::new(100).fraction(100), 0.0);
+    }
 
     #[test]
     fn running_a_consumed_node_is_a_no_op() {

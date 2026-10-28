@@ -1,3 +1,5 @@
+mod lifecycle;
+
 use bdk_kyoto::bip157;
 use bdk_kyoto::bip157::lookup_host;
 use bdk_kyoto::bip157::tokio;
@@ -14,6 +16,7 @@ use bdk_kyoto::Requester;
 use bdk_kyoto::TrustedPeer;
 use bdk_kyoto::UpdateSubscriber;
 use bdk_kyoto::Warning as Warn;
+use lifecycle::NodeLifecycle;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -44,9 +47,12 @@ pub struct CbfComponents {
 }
 
 /// A [`CbfClient`] handles wallet updates from a [`CbfNode`].
+/// Dropping the last client reference requests node cancellation. Pending foreign
+/// calls can retain a client reference until their futures are cancelled or released.
 #[derive(Debug, uniffi::Object)]
 pub struct CbfClient {
     sender: Arc<Requester>,
+    lifecycle: Arc<NodeLifecycle>,
     info_rx: Mutex<(Receiver<bdk_kyoto::Info>, ScanProgress)>,
     warning_rx: Mutex<Receiver<bdk_kyoto::Warning>>,
     update_rx: Mutex<UpdateSubscriber<bdk_kyoto::wallets::Single>>,
@@ -55,30 +61,30 @@ pub struct CbfClient {
 /// A [`CbfNode`] gathers transactions for a [`Wallet`].
 /// To receive [`Update`] for [`Wallet`], refer to the
 /// [`CbfClient`]. The [`CbfNode`] will run until instructed
-/// to stop.
+/// to stop. Dropping its last reference also requests cancellation.
 #[derive(Debug, uniffi::Object)]
 pub struct CbfNode {
-    node: std::sync::Mutex<Option<Node>>,
+    lifecycle: Arc<NodeLifecycle>,
 }
 
 #[uniffi::export]
 impl CbfNode {
-    /// Start the node on a detached OS thread and immediately return.
+    /// Start the node on its owned OS thread and immediately return.
     /// Subsequent calls have no effect.
     pub fn run(self: Arc<Self>) {
-        let mut lock = self.node.lock().unwrap();
-        let Some(node) = lock.take() else {
-            return;
-        };
-        std::thread::spawn(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(async move {
-                    let _ = node.run().await;
-                })
-        });
+        self.lifecycle.run();
+    }
+
+    /// Wait at most `timeout_millis` for the native thread and its Tokio runtime to exit.
+    ///
+    /// A false result means the caller must retain ownership and may wait again. An OS DNS
+    /// resolver that cannot be interrupted can delay runtime teardown beyond this timeout.
+    /// Before run, returns false until the client has shut down and the stored node is dropped.
+    pub async fn await_termination(&self, timeout_millis: u64) -> bool {
+        self.lifecycle
+            .clone()
+            .await_termination(Duration::from_millis(timeout_millis))
+            .await
     }
 }
 
@@ -87,13 +93,12 @@ impl CbfNode {
 /// Options:
 /// * List of `Peer`: Bitcoin full-nodes for the light client to connect to. May be empty.
 /// * `connections`: The number of connections for the light client to maintain.
-/// * `scan_type`: Sync, recover, or start a new wallet. For more information see [`ScanType`].
+/// * `scan_type`: Sync from the wallet checkpoint or recover from an exact checkpoint.
 ///
-/// A note on recovering wallets. Developers should allow users to provide an
-/// approximate recovery height and an estimated number of transactions for the
-/// wallet. When determining how many scripts to check filters for, the `Wallet`
-/// `lookahead` value will be used. To ensure all transactions are recovered, the
-/// `lookahead` should be roughly the number of transactions in the wallet history.
+/// Recovery checks a finite script range selected by `used_script_index`, starting
+/// strictly after the chosen height/hash checkpoint. This bound is a script count,
+/// not an inclusive derivation index or an Electrum stop gap. It must cover every
+/// address that may have been used; the builder does not discover an arbitrary range.
 #[derive(Clone, uniffi::Object)]
 pub struct CbfBuilder {
     connections: u8,
@@ -130,7 +135,7 @@ impl CbfBuilder {
         })
     }
 
-    /// Select between syncing, recovering, or scanning for new wallets.
+    /// Select routine syncing or recovery from an exact checkpoint.
     pub fn scan_type(&self, scan_type: ScanType) -> Arc<Self> {
         Arc::new(CbfBuilder {
             scan_type,
@@ -251,12 +256,14 @@ impl CbfBuilder {
         let (client, node) = client.managed_start();
         let requester = client.requester();
 
+        let lifecycle = Arc::new(NodeLifecycle::new(Some(node)));
         let node = CbfNode {
-            node: std::sync::Mutex::new(Some(node)),
+            lifecycle: lifecycle.clone(),
         };
 
         let client = CbfClient {
             sender: Arc::new(requester),
+            lifecycle,
             info_rx: Mutex::new((logging.info_subscriber, ScanProgress::new(start_height))),
             warning_rx: Mutex::new(logging.warning_subscriber),
             update_rx: Mutex::new(update_subscriber),
@@ -379,14 +386,31 @@ impl CbfClient {
             .collect())
     }
 
-    /// Check if the node is still running in the background.
+    /// Check whether the node accepts requests and has not been asked to stop.
+    /// Use [`CbfNode::await_termination`] to acknowledge that its native thread has exited.
     pub fn is_running(&self) -> bool {
-        self.sender.is_running()
+        !self.lifecycle.stop_requested() && self.sender.is_running()
     }
 
-    /// Stop the [`CbfNode`]. Errors if the node is already stopped.
+    /// Request cancellation of the [`CbfNode`], including pending peer or DNS setup.
+    /// Errors if the native request channel is already closed. Await the node's
+    /// termination before releasing ownership of the wallet operation.
     pub fn shutdown(&self) -> Result<(), CbfError> {
-        self.sender.shutdown().map_err(From::from)
+        let result = self.sender.shutdown().map_err(From::from);
+        self.lifecycle.request_stop();
+        result
+    }
+}
+
+impl Drop for CbfClient {
+    fn drop(&mut self) {
+        self.lifecycle.request_stop();
+    }
+}
+
+impl Drop for CbfNode {
+    fn drop(&mut self) {
+        self.lifecycle.request_stop();
     }
 }
 
@@ -639,8 +663,8 @@ impl DisplayExt for RejectReason {
 
 #[cfg(test)]
 mod tests {
-    use super::CbfNode;
-    use std::sync::{Arc, Mutex};
+    use super::{CbfNode, NodeLifecycle};
+    use std::sync::Arc;
 
     #[test]
     fn progress_uses_the_scan_checkpoint_and_current_header_tip() {
@@ -662,7 +686,7 @@ mod tests {
     #[test]
     fn running_a_consumed_node_is_a_no_op() {
         let node = Arc::new(CbfNode {
-            node: Mutex::new(None),
+            lifecycle: Arc::new(NodeLifecycle::new(None)),
         });
 
         node.run();

@@ -42,6 +42,8 @@ just publish-local
 
 See [Compact block filter nodes](docs/CBF.md) for the long-running, multi-wallet Kyoto API and recovery checkpoints.
 
+Leased clients expose `poll_update_batch()` with a safe scanned checkpoint and `synced_to_tip` completion flag; `RecoveryPoint::LastCheckpoint` resumes persisted recovery while retaining its original script count.
+
 ## Contributing
 
 To add new structs and functions, see the [UniFFI User Guide](https://mozilla.github.io/uniffi-rs/) and the [uniffi-examples](https://thunderbiscuit.github.io/uniffi-examples/) repository.

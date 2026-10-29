@@ -206,7 +206,7 @@ dependencies = [
 [[package]]
 name = "bdk_kyoto"
 version = "0.18.1"
-source = "git+https://github.com/ethicnology-agent/bdk-kyoto?rev=cdf8522c1756f328d9a0091f5839a3cbcf90420c#cdf8522c1756f328d9a0091f5839a3cbcf90420c"
+source = "git+https://github.com/ethicnology-agent/bdk-kyoto?rev=0a63d9cee88c59c7246945cf72976aad64a9152a#0a63d9cee88c59c7246945cf72976aad64a9152a"
 dependencies = [
  "bdk_wallet",
  "bip157",

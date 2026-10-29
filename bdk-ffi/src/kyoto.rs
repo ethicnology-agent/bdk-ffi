@@ -240,21 +240,7 @@ impl CbfBuilder {
 
         let recovery_checkpoint = match self.scan_type.clone() {
             ScanType::Sync => None,
-            ScanType::Recovery { checkpoint, .. } => Some(match checkpoint {
-                RecoveryPoint::GenesisBlock => HashCheckpoint::from_genesis(wallet.network()),
-                RecoveryPoint::SegwitActivation if wallet.network() == Network::Bitcoin => {
-                    HashCheckpoint::segwit_activation()
-                }
-                RecoveryPoint::TaprootActivation if wallet.network() == Network::Bitcoin => {
-                    HashCheckpoint::taproot_activation()
-                }
-                RecoveryPoint::SegwitActivation | RecoveryPoint::TaprootActivation => {
-                    HashCheckpoint::from_genesis(wallet.network())
-                }
-                RecoveryPoint::Other { birthday } => {
-                    HashCheckpoint::new(birthday.height, birthday.hash.0)
-                }
-            }),
+            ScanType::Recovery { checkpoint, .. } => Some(recovery_checkpoint(&wallet, checkpoint)),
         };
         let start_height = recovery_checkpoint
             .map(|cp| cp.height)
@@ -269,14 +255,24 @@ impl CbfBuilder {
             ),
             ScanType::Recovery {
                 used_script_index, ..
-            } => builder.build_with_wallet(
-                &wallet,
-                bdk_kyoto::SyncConfig::wallet_recovery_sync(
+            } => {
+                let sync = bdk_kyoto::SyncConfig::wallet_recovery_sync(
                     recovery_checkpoint.expect("recovery checkpoint was resolved"),
                     used_script_index,
-                )
-                .build(),
-            ),
+                );
+                let sync = if matches!(
+                    self.scan_type,
+                    ScanType::Recovery {
+                        checkpoint: RecoveryPoint::LastCheckpoint,
+                        ..
+                    }
+                ) {
+                    sync.reuse_persisted_history()
+                } else {
+                    sync
+                };
+                builder.build_with_wallet(&wallet, sync.build())
+            }
         }
         .expect("networks match by definition");
         let (client, logging, subscriber) = client.subscribe();
@@ -388,13 +384,35 @@ impl CbfBuilder {
 
 // Keep the progress denominator aligned with Kyoto's bounded-height reorg rewind.
 fn sync_start_height(wallet: &bdk_wallet::Wallet) -> u32 {
+    sync_start_checkpoint(wallet).height
+}
+
+fn sync_start_checkpoint(wallet: &bdk_wallet::Wallet) -> HashCheckpoint {
     let tip = wallet.latest_checkpoint();
     let floor = tip.height().saturating_sub(7);
-    tip.iter()
+    let checkpoint = tip
+        .iter()
         .take_while(|cp| cp.height() >= floor)
         .last()
-        .unwrap()
-        .height()
+        .unwrap();
+    HashCheckpoint::new(checkpoint.height(), checkpoint.hash())
+}
+
+fn recovery_checkpoint(wallet: &bdk_wallet::Wallet, point: RecoveryPoint) -> HashCheckpoint {
+    match point {
+        RecoveryPoint::GenesisBlock => HashCheckpoint::from_genesis(wallet.network()),
+        RecoveryPoint::SegwitActivation if wallet.network() == Network::Bitcoin => {
+            HashCheckpoint::segwit_activation()
+        }
+        RecoveryPoint::TaprootActivation if wallet.network() == Network::Bitcoin => {
+            HashCheckpoint::taproot_activation()
+        }
+        RecoveryPoint::SegwitActivation | RecoveryPoint::TaprootActivation => {
+            HashCheckpoint::from_genesis(wallet.network())
+        }
+        RecoveryPoint::Other { birthday } => HashCheckpoint::new(birthday.height, birthday.hash.0),
+        RecoveryPoint::LastCheckpoint => sync_start_checkpoint(wallet),
+    }
 }
 
 fn wallet_descriptor_id(wallet: &bdk_wallet::Wallet) -> String {
@@ -458,6 +476,7 @@ fn components(
 pub struct CbfStatus {
     pub running: bool,
     pub terminated: bool,
+    /// Latest prepared boundary that completed filter sync to tip, excluding partial progress.
     pub synced_tip: Option<BlockId>,
     pub last_error: Option<String>,
     /// Diagnostic messages replaced or discarded by the bounded info queue.
@@ -466,12 +485,42 @@ pub struct CbfStatus {
     pub warnings_dropped: u64,
 }
 
+/// One safe-to-persist scan boundary for every wallet in the node.
+#[derive(Clone, uniffi::Record)]
+pub struct CbfUpdateBatch {
+    /// Updates keyed by each wallet's public external descriptor identifier.
+    pub updates: HashMap<String, Arc<Update>>,
+    /// Verified checkpoint reached after checking filters and applying matched blocks.
+    /// A wallet already persisted ahead retains its prior chain tip until scanning catches up.
+    pub scanned_tip: BlockId,
+    /// Whether this boundary also completed the node's current filter sync to its tip.
+    pub synced_to_tip: bool,
+}
+
+impl std::fmt::Debug for CbfUpdateBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CbfUpdateBatch")
+            .field("wallet_count", &self.updates.len())
+            .field("scanned_tip", &self.scanned_tip)
+            .field("synced_to_tip", &self.synced_to_tip)
+            .finish()
+    }
+}
+
 #[uniffi::export]
 impl CbfClient {
     /// Remove the oldest complete per-wallet batch, or return None immediately.
     /// Requires owner_lease_millis. Batches remain drainable after termination.
+    /// This includes intermediate checkpoints; use poll_update_batch for completion metadata.
     pub fn poll_updates(&self) -> Result<Option<HashMap<String, Arc<Update>>>, CbfError> {
         Ok(self.polling()?.poll_updates())
+    }
+
+    /// Remove the oldest complete boundary with its scan checkpoint and completion signal.
+    /// Requires owner_lease_millis. Use one polling method: poll_updates consumes the same FIFO
+    /// while discarding metadata. Apply and persist all wallet updates before the next poll.
+    pub fn poll_update_batch(&self) -> Result<Option<CbfUpdateBatch>, CbfError> {
+        Ok(self.polling()?.poll_update_batch())
     }
 
     /// Drain bounded diagnostic information without waiting or foreign callbacks.
@@ -937,6 +986,9 @@ pub enum RecoveryPoint {
     Other {
         birthday: BlockId,
     },
+    /// Resume from the persisted wallet checkpoint with the normal bounded reorg rewind.
+    /// Keep the original recovery script count when rebuilding an interrupted recovery.
+    LastCheckpoint,
 }
 
 /// A peer to connect to over the Bitcoin peer-to-peer network.
@@ -1250,6 +1302,7 @@ mod tests {
         let components = leased.build(&wallet);
         assert!(components.client.legacy.is_none());
         assert!(components.client.poll_updates().unwrap().is_none());
+        assert!(components.client.poll_update_batch().unwrap().is_none());
         assert!(components.client.drain_info().unwrap().is_empty());
         assert!(components.client.drain_warnings().unwrap().is_empty());
         assert!(!components.client.status().terminated);
@@ -1281,10 +1334,53 @@ mod tests {
         assert!(components.node.is_terminated());
         let legacy = builder.build(&wallet);
         assert!(legacy.client.poll_updates().is_err());
+        assert!(legacy.client.poll_update_batch().is_err());
         assert!(legacy.client.drain_info().is_err());
         assert!(legacy.client.drain_warnings().is_err());
         assert!(legacy.client.renew_lease().is_err());
         legacy.client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_can_explicitly_resume_the_last_persisted_checkpoint() {
+        let wallet = public_wallet(0, 25);
+        wallet.insert_checkpoint(checkpoint(900_000)).unwrap();
+        wallet.insert_checkpoint(checkpoint(901_000)).unwrap();
+        let start =
+            super::recovery_checkpoint(&wallet.get_wallet(), super::RecoveryPoint::LastCheckpoint);
+        assert_eq!(start.height, 901_000);
+        assert_eq!(start.hash, checkpoint(901_000).hash.0);
+        // Sparse checkpoints do not rewind an entire recovery interval or to genesis.
+        for height in 901_001..=901_010 {
+            wallet.insert_checkpoint(checkpoint(height)).unwrap();
+        }
+        let start =
+            super::recovery_checkpoint(&wallet.get_wallet(), super::RecoveryPoint::LastCheckpoint);
+        assert_eq!(start.height, 901_003);
+        assert_eq!(start.hash, checkpoint(901_003).hash.0);
+        // An explicit birthday still requests that exact scan, even after later persistence.
+        assert_eq!(
+            super::recovery_checkpoint(
+                &wallet.get_wallet(),
+                super::RecoveryPoint::Other {
+                    birthday: checkpoint(900_000)
+                }
+            )
+            .height,
+            900_000
+        );
+        let components = super::CbfBuilder::new()
+            .only_configured_peers()
+            .owner_lease_millis(1000)
+            .unwrap()
+            .scan_type(super::ScanType::Recovery {
+                used_script_index: 1000,
+                checkpoint: super::RecoveryPoint::LastCheckpoint,
+            })
+            .build(&wallet);
+        assert!(components.client.poll_update_batch().unwrap().is_none());
+        components.client.shutdown().unwrap();
+        assert!(components.node.is_terminated());
     }
 
     #[test]

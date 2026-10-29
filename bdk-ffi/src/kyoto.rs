@@ -1,4 +1,5 @@
 mod lifecycle;
+mod polling;
 
 use bdk_kyoto::bip157;
 use bdk_kyoto::bip157::lookup_host;
@@ -17,6 +18,7 @@ use bdk_kyoto::TrustedPeer;
 use bdk_kyoto::UpdateSubscriber;
 use bdk_kyoto::Warning as Warn;
 use lifecycle::NodeLifecycle;
+use polling::{Polling, PollingWorker};
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -54,6 +56,12 @@ pub struct CbfComponents {
 pub struct CbfClient {
     sender: Arc<Requester>,
     lifecycle: Arc<NodeLifecycle>,
+    legacy: Option<LegacyReceivers>,
+    polling: Option<Arc<Polling>>,
+}
+
+#[derive(Debug)]
+struct LegacyReceivers {
     info_rx: Mutex<InfoReceiver>,
     sync_info_tx: tokio::sync::mpsc::UnboundedSender<Info>,
     warning_rx: Mutex<Receiver<bdk_kyoto::Warning>>,
@@ -87,8 +95,14 @@ pub struct CbfNode {
 
 #[uniffi::export]
 impl CbfNode {
+    /// Acknowledge actual thread and runtime teardown without waiting or callbacks.
+    /// Before run this is false until shutdown. True results include a completed native join.
+    pub fn is_terminated(&self) -> bool {
+        self.lifecycle.is_terminated()
+    }
+
     /// Start the node on its owned OS thread and immediately return.
-    /// Subsequent calls have no effect.
+    /// Subsequent calls have no effect. A configured owner lease starts here.
     pub fn run(self: Arc<Self>) {
         self.lifecycle.run();
     }
@@ -126,6 +140,7 @@ pub struct CbfBuilder {
     socks5_proxy: Option<Socks5Proxy>,
     peers: Vec<Peer>,
     whitelist_only: bool,
+    owner_lease: Option<Duration>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -142,7 +157,22 @@ impl CbfBuilder {
             socks5_proxy: None,
             peers: Vec::new(),
             whitelist_only: false,
+            owner_lease: None,
         }
+    }
+
+    /// Enable callback-free polling with a renewable owner lease, starting at `run()`.
+    /// A zero TTL or a TTL above one day is rejected. Legacy builds have no lease.
+    pub fn owner_lease_millis(&self, ttl_millis: u64) -> Result<Arc<Self>, CbfError> {
+        if ttl_millis == 0 || ttl_millis > 86_400_000 {
+            return Err(CbfError::InvalidConfiguration {
+                reason: "owner lease TTL must be between 1 and 86400000 milliseconds".into(),
+            });
+        }
+        Ok(Arc::new(Self {
+            owner_lease: Some(Duration::from_millis(ttl_millis)),
+            ..self.clone()
+        }))
     }
 
     /// The number of connections for the light client to maintain. Default is two.
@@ -260,6 +290,7 @@ impl CbfBuilder {
                 subscriber,
             },
             start_height,
+            self.owner_lease,
         )
     }
 
@@ -333,6 +364,7 @@ impl CbfBuilder {
             logging,
             WalletUpdates::Multiple(subscriber),
             start_height,
+            self.owner_lease,
         ))
     }
 }
@@ -379,9 +411,35 @@ fn components(
     logging: bdk_kyoto::LoggingSubscribers,
     updates: WalletUpdates,
     start_height: u32,
+    owner_lease: Option<Duration>,
 ) -> CbfComponents {
-    let lifecycle = Arc::new(NodeLifecycle::new(Some(node)));
     let (sync_info_tx, synced) = tokio::sync::mpsc::unbounded_channel();
+    let (legacy, polling, worker) = if owner_lease.is_some() {
+        let polling = Arc::new(Polling::new());
+        let worker = PollingWorker::new(logging, updates, start_height, polling.clone());
+        (None, Some(polling), Some(worker))
+    } else {
+        (
+            Some(LegacyReceivers {
+                info_rx: Mutex::new(InfoReceiver {
+                    native: logging.info_subscriber,
+                    synced,
+                    progress: ScanProgress::new(start_height),
+                }),
+                sync_info_tx,
+                warning_rx: Mutex::new(logging.warning_subscriber),
+                update_rx: Mutex::new(updates),
+            }),
+            None,
+            None,
+        )
+    };
+    let lifecycle = Arc::new(NodeLifecycle::with_polling(
+        Some(node),
+        owner_lease,
+        worker,
+        polling.clone(),
+    ));
     CbfComponents {
         node: Arc::new(CbfNode {
             lifecycle: lifecycle.clone(),
@@ -389,23 +447,69 @@ fn components(
         client: Arc::new(CbfClient {
             sender: Arc::new(requester),
             lifecycle,
-            info_rx: Mutex::new(InfoReceiver {
-                native: logging.info_subscriber,
-                synced,
-                progress: ScanProgress::new(start_height),
-            }),
-            sync_info_tx,
-            warning_rx: Mutex::new(logging.warning_subscriber),
-            update_rx: Mutex::new(updates),
+            legacy,
+            polling,
         }),
     }
 }
 
+/// Snapshot available synchronously without registering any foreign callback.
+#[derive(Debug, uniffi::Record)]
+pub struct CbfStatus {
+    pub running: bool,
+    pub terminated: bool,
+    pub synced_tip: Option<BlockId>,
+    pub last_error: Option<String>,
+    /// Diagnostic messages replaced or discarded by the bounded info queue.
+    pub info_dropped: u64,
+    /// Oldest warnings discarded by the bounded warning queue.
+    pub warnings_dropped: u64,
+}
+
 #[uniffi::export]
 impl CbfClient {
+    /// Remove the oldest complete per-wallet batch, or return None immediately.
+    /// Requires owner_lease_millis. Batches remain drainable after termination.
+    pub fn poll_updates(&self) -> Result<Option<HashMap<String, Arc<Update>>>, CbfError> {
+        Ok(self.polling()?.poll_updates())
+    }
+
+    /// Drain bounded diagnostic information without waiting or foreign callbacks.
+    pub fn drain_info(&self) -> Result<Vec<Info>, CbfError> {
+        Ok(self.polling()?.drain_info())
+    }
+
+    /// Drain bounded warnings without waiting or foreign callbacks.
+    pub fn drain_warnings(&self) -> Result<Vec<Warning>, CbfError> {
+        Ok(self.polling()?.drain_warnings())
+    }
+
+    /// Extend a live owner's deadline by its configured TTL. Cannot revive an expired node.
+    pub fn renew_lease(&self) -> Result<(), CbfError> {
+        self.polling()?;
+        self.lifecycle.renew_lease()
+    }
+
+    /// Read native state without awaiting or registering a foreign completion.
+    pub fn status(&self) -> CbfStatus {
+        let (synced_tip, last_error, info_dropped, warnings_dropped) = self
+            .polling
+            .as_ref()
+            .map(|polling| polling.snapshot())
+            .unwrap_or((None, None, 0, 0));
+        CbfStatus {
+            running: self.is_running(),
+            terminated: self.lifecycle.is_terminated(),
+            synced_tip,
+            last_error,
+            info_dropped,
+            warnings_dropped,
+        }
+    }
+
     /// Return the next available info message from a node. If none is returned, the node has stopped.
     pub async fn next_info(&self) -> Result<Info, CbfError> {
-        let mut info = self.info_rx.lock().await;
+        let mut info = self.legacy()?.info_rx.lock().await;
         let InfoReceiver {
             native,
             synced,
@@ -420,7 +524,7 @@ impl CbfClient {
 
     /// Return the next available warning message from a node. If none is returned, the node has stopped.
     pub async fn next_warning(&self) -> Result<Warning, CbfError> {
-        let mut warn_rx = self.warning_rx.lock().await;
+        let mut warn_rx = self.legacy()?.warning_rx.lock().await;
         warn_rx
             .recv()
             .await
@@ -433,7 +537,7 @@ impl CbfClient {
     /// Cancellation preserves pending work. Only valid for the single-wallet builder.
     /// Apply and persist each returned update before requesting another.
     pub async fn update(&self) -> Result<Update, CbfError> {
-        let mut receiver = self.update_rx.lock().await;
+        let mut receiver = self.legacy()?.update_rx.lock().await;
         let WalletUpdates::Single { subscriber, .. } = &mut *receiver else {
             return Err(CbfError::InvalidConfiguration {
                 reason: "use updates() with a multi-wallet node".into(),
@@ -451,7 +555,7 @@ impl CbfClient {
     /// Works with both builders. Call in a continual loop, applying/persisting every update
     /// to the wallet whose `descriptor_id(External)` matches its key. Cancellation is safe.
     pub async fn updates(&self) -> Result<HashMap<String, Arc<Update>>, CbfError> {
-        let mut receiver = self.update_rx.lock().await;
+        let mut receiver = self.legacy()?.update_rx.lock().await;
         let updates: HashMap<String, Arc<Update>> = match &mut *receiver {
             WalletUpdates::Single {
                 descriptor_id,
@@ -635,12 +739,32 @@ impl CbfClient {
 }
 
 impl CbfClient {
+    fn legacy(&self) -> Result<&LegacyReceivers, CbfError> {
+        self.legacy.as_ref().ok_or_else(|| CbfError::InvalidConfiguration {
+            reason: "leased nodes require synchronous polling; legacy event futures are unsafe across isolate death".into(),
+        })
+    }
+
+    fn polling(&self) -> Result<&Polling, CbfError> {
+        self.polling
+            .as_deref()
+            .ok_or_else(|| CbfError::InvalidConfiguration {
+                reason: "configure owner_lease_millis before building to use callback-free polling"
+                    .into(),
+            })
+    }
+
     fn notify_synced(&self, update: &bdk_wallet::Update) {
         if let Some(cp) = &update.chain {
             // An unbounded send cannot suspend after the subscriber has consumed the boundary.
-            let _ = self.sync_info_tx.send(Info::Synced {
-                tip: cp.block_id().into(),
-            });
+            let _ = self
+                .legacy
+                .as_ref()
+                .unwrap()
+                .sync_info_tx
+                .send(Info::Synced {
+                    tip: cp.block_id().into(),
+                });
         }
     }
 }
@@ -679,7 +803,8 @@ pub enum Info {
         fraction: f32,
     },
     /// Filters and queued matching blocks have reached this wallet update boundary.
-    /// Emitted only when `update`/`updates` returns. The application must still apply and persist
+    /// Emitted when a legacy update returns or a complete polling batch is queued.
+    /// The application must still apply and persist
     /// that update. A `NewChainHeight` above this tip signals another scanning interval;
     /// lower heights may still be queued in the independent native information stream.
     Synced { tip: BlockId },
@@ -1113,6 +1238,105 @@ mod tests {
         );
         components.client.shutdown().unwrap();
         assert!(components.node.await_termination(1000).await);
+    }
+
+    #[tokio::test]
+    async fn leased_clients_only_expose_callback_free_event_consumption() {
+        let wallet = public_wallet(0, 25);
+        let builder = super::CbfBuilder::new().only_configured_peers();
+        assert!(builder.owner_lease_millis(0).is_err());
+        assert!(builder.owner_lease_millis(86_400_001).is_err());
+        let leased = builder.owner_lease_millis(1000).unwrap();
+        let components = leased.build(&wallet);
+        assert!(components.client.legacy.is_none());
+        assert!(components.client.poll_updates().unwrap().is_none());
+        assert!(components.client.drain_info().unwrap().is_empty());
+        assert!(components.client.drain_warnings().unwrap().is_empty());
+        assert!(!components.client.status().terminated);
+        assert!(matches!(
+            components.client.next_info().await,
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            components.client.next_warning().await,
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            components.client.update().await,
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        assert!(matches!(
+            components.client.updates().await,
+            Err(crate::error::CbfError::InvalidConfiguration { .. })
+        ));
+        components.client.shutdown().unwrap();
+        assert!(components.node.is_terminated());
+        assert!(components.client.status().terminated);
+        assert!(components.client.poll_updates().unwrap().is_none());
+        assert!(matches!(
+            components.client.renew_lease(),
+            Err(crate::error::CbfError::NodeStopped)
+        ));
+        components.node.clone().run();
+        assert!(components.node.is_terminated());
+        let legacy = builder.build(&wallet);
+        assert!(legacy.client.poll_updates().is_err());
+        assert!(legacy.client.drain_info().is_err());
+        assert!(legacy.client.drain_warnings().is_err());
+        assert!(legacy.client.renew_lease().is_err());
+        legacy.client.shutdown().unwrap();
+    }
+
+    #[test]
+    fn leased_shutdown_uses_only_synchronous_native_operations() {
+        use std::{
+            io::Read,
+            net::TcpListener,
+            time::{Duration, Instant},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected, accepted) = std::sync::mpsc::channel();
+        let peer = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            connected.send(()).unwrap();
+            let mut buffer = [0; 4096];
+            loop {
+                match socket.read(&mut buffer) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) => panic!("native shutdown must close peer socket: {}", error),
+                }
+            }
+        });
+        let wallet = public_wallet(0, 25);
+        let components = super::CbfBuilder::new()
+            .only_configured_peers()
+            .connections(1)
+            .configure_timeout_millis(60000, 60000)
+            .peers(vec![super::Peer {
+                address: std::sync::Arc::new(super::IpAddress::from_ipv4(127, 0, 0, 1)),
+                port: Some(port),
+                v2_transport: false,
+            }])
+            .owner_lease_millis(1000)
+            .unwrap()
+            .build(&wallet);
+        components.node.clone().run();
+        accepted.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(components.client.legacy.is_none());
+        components.client.shutdown().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !components.node.is_terminated() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!components.client.status().running);
+        assert!(components.client.status().terminated);
+        peer.join().unwrap();
     }
 
     #[tokio::test]

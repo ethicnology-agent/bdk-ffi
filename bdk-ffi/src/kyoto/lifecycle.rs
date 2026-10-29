@@ -1,4 +1,7 @@
-use super::{tokio, Node};
+use super::{
+    polling::{Polling, PollingWorker},
+    tokio, CbfError, Node,
+};
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -10,6 +13,8 @@ struct RunState {
     node: Option<Node>,
     thread: Option<JoinHandle<()>>,
     started: bool,
+    worker: Option<PollingWorker>,
+    lease_deadline: Option<Instant>,
 }
 
 /// Owns the native thread until it has actually exited, including runtime teardown.
@@ -18,19 +23,38 @@ pub(super) struct NodeLifecycle {
     state: Mutex<RunState>,
     completed: Condvar,
     stop: watch::Sender<bool>,
+    lease_ttl: Option<Duration>,
+    renewed: watch::Sender<Option<Instant>>,
+    polling: Option<Arc<Polling>>,
 }
 
 impl NodeLifecycle {
+    #[cfg(test)]
     pub(super) fn new(node: Option<Node>) -> Self {
+        Self::with_polling(node, None, None, None)
+    }
+
+    pub(super) fn with_polling(
+        node: Option<Node>,
+        lease_ttl: Option<Duration>,
+        worker: Option<PollingWorker>,
+        polling: Option<Arc<Polling>>,
+    ) -> Self {
         let (stop, _) = watch::channel(false);
+        let (renewed, _) = watch::channel(None);
         Self {
             state: Mutex::new(RunState {
                 node,
                 thread: None,
                 started: false,
+                worker,
+                lease_deadline: None,
             }),
             completed: Condvar::new(),
             stop,
+            lease_ttl,
+            renewed,
+            polling,
         }
     }
 
@@ -39,8 +63,23 @@ impl NodeLifecycle {
         let Some(node) = state.node.take() else {
             return;
         };
+        let worker = state.worker.take();
+        let polling = self.polling.clone();
+        let lifecycle = self.clone();
         self.spawn_locked(&mut state, async move {
-            let _ = node.run().await;
+            if let Some(worker) = worker {
+                tokio::select! {
+                    result = node.run() => {
+                        if let (Err(error), Some(polling)) = (result, polling) {
+                            polling.error(error.to_string());
+                        }
+                    },
+                    _ = worker.run() => {},
+                }
+            } else {
+                let _ = node.run().await;
+            }
+            lifecycle.request_stop();
         });
     }
 
@@ -52,18 +91,27 @@ impl NodeLifecycle {
             return;
         }
         state.started = true;
+        if let Some(ttl) = self.lease_ttl {
+            let deadline = Instant::now()
+                .checked_add(ttl)
+                .expect("validated lease TTL fits Instant");
+            state.lease_deadline = Some(deadline);
+            self.renewed.send_replace(Some(deadline));
+        }
         let lifecycle = Arc::clone(self);
         let mut stop = self.stop.subscribe();
+        let owner = self.clone();
         state.thread = std::thread::Builder::new()
             .name("bdk-cbf".into())
             .spawn(move || {
                 struct Completion(Arc<NodeLifecycle>);
                 impl Drop for Completion {
                     fn drop(&mut self) {
+                        self.0.stop.send_replace(true);
                         self.0.completed.notify_all();
                     }
                 }
-                let _completion = Completion(lifecycle);
+                let _completion = Completion(lifecycle.clone());
                 if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -72,9 +120,18 @@ impl NodeLifecycle {
                         tokio::select! {
                             biased;
                             _ = stop.wait_for(|requested| *requested) => {},
+                            _ = owner.wait_for_lease_expiry() => {},
                             _ = task => {},
                         }
                     });
+                } else if let Some(polling) = &lifecycle.polling {
+                    polling.error("failed to create native node runtime");
+                }
+            })
+            .map_err(|error| {
+                self.stop.send_replace(true);
+                if let Some(polling) = &self.polling {
+                    polling.error(format!("failed to start native node thread: {error}"));
                 }
             })
             .ok();
@@ -86,12 +143,80 @@ impl NodeLifecycle {
         if !state.started {
             // A shutdown before run must also close the native channels immediately.
             state.node.take();
+            state.worker.take();
         }
         self.completed.notify_all();
     }
 
     pub(super) fn stop_requested(&self) -> bool {
         *self.stop.borrow()
+    }
+
+    pub(super) fn renew_lease(&self) -> Result<(), CbfError> {
+        let ttl = self
+            .lease_ttl
+            .ok_or_else(|| CbfError::InvalidConfiguration {
+                reason: "this node has no owner lease".into(),
+            })?;
+        let mut state = self.state.lock().unwrap();
+        if self.stop_requested()
+            || !state.started
+            || state
+                .thread
+                .as_ref()
+                .is_none_or(|thread| thread.is_finished())
+        {
+            return Err(CbfError::NodeStopped);
+        }
+        let now = Instant::now();
+        if state.lease_deadline.is_some_and(|deadline| now >= deadline) {
+            self.stop.send_replace(true);
+            if let Some(polling) = &self.polling {
+                polling.error("owner lease expired");
+            }
+            return Err(CbfError::NodeStopped);
+        }
+        let deadline = now
+            .checked_add(ttl)
+            .expect("validated lease TTL fits Instant");
+        state.lease_deadline = Some(deadline);
+        self.renewed.send_replace(Some(deadline));
+        Ok(())
+    }
+
+    async fn wait_for_lease_expiry(&self) {
+        let mut renewed = self.renewed.subscribe();
+        loop {
+            let deadline = *renewed.borrow_and_update();
+            let Some(deadline) = deadline else {
+                std::future::pending::<()>().await;
+                return;
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    // Serialize with renewal: an already-expired owner cannot revive the node.
+                    let state = self.state.lock().unwrap();
+                    if state.lease_deadline.is_some_and(|current| Instant::now() >= current) {
+                        self.stop.send_replace(true);
+                        if let Some(polling) = &self.polling { polling.error("owner lease expired"); }
+                        return;
+                    }
+                },
+                _ = renewed.changed() => {},
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn spawn_for_test<F>(self: &Arc<Self>, task: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.spawn_locked(&mut self.state.lock().unwrap(), task);
+    }
+
+    pub(super) fn is_terminated(&self) -> bool {
+        self.wait(Duration::ZERO)
     }
 
     fn wait(&self, timeout: Duration) -> bool {
@@ -144,6 +269,67 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn an_unrenewed_owner_lease_terminates_pending_setup() {
+        let lifecycle = leased_lifecycle(Duration::from_millis(40));
+        let (entered, ready) = std::sync::mpsc::channel();
+        lifecycle.spawn_locked(&mut lifecycle.state.lock().unwrap(), async move {
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        let stopped = executor().block_on(
+            lifecycle
+                .clone()
+                .await_termination(Duration::from_millis(500)),
+        );
+        lifecycle.request_stop();
+        assert!(executor().block_on(lifecycle.await_termination(Duration::from_secs(1))));
+        assert!(
+            stopped,
+            "a dead owner must not leave native setup running beyond its lease"
+        );
+    }
+
+    fn leased_lifecycle(ttl: Duration) -> Arc<NodeLifecycle> {
+        Arc::new(NodeLifecycle::with_polling(None, Some(ttl), None, None))
+    }
+
+    #[test]
+    fn renewal_keeps_the_native_task_alive_but_never_revives_an_expired_owner() {
+        let lifecycle = leased_lifecycle(Duration::from_millis(120));
+        lifecycle.spawn_locked(&mut lifecycle.state.lock().unwrap(), std::future::pending());
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(40));
+            lifecycle.renew_lease().unwrap();
+            assert!(!lifecycle.is_terminated());
+        }
+        assert!(executor().block_on(lifecycle.clone().await_termination(Duration::from_secs(1))));
+        assert!(matches!(
+            lifecycle.renew_lease(),
+            Err(CbfError::NodeStopped)
+        ));
+    }
+
+    #[test]
+    fn expired_deadline_cannot_be_renewed_before_the_runtime_polls_its_timer() {
+        let lifecycle = leased_lifecycle(Duration::from_millis(40));
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (release, receive) = std::sync::mpsc::channel();
+        lifecycle.spawn_locked(&mut lifecycle.state.lock().unwrap(), async move {
+            entered.send(()).unwrap();
+            receive.recv_timeout(Duration::from_secs(1)).unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(
+            lifecycle.renew_lease(),
+            Err(CbfError::NodeStopped)
+        ));
+        release.send(()).unwrap();
+        assert!(executor().block_on(lifecycle.await_termination(Duration::from_secs(1))));
     }
 
     #[test]
